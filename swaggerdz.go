@@ -5,13 +5,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
-	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
@@ -22,26 +22,73 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"text/tabwriter"
+	"text/template"
 	"time"
 
-	"github.com/projectdiscovery/subfinder/v2/pkg/passive"
-	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
 	"github.com/projectdiscovery/subfinder/v2/pkg/runner"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/time/rate"
 
-	// Custom modules
-	"github.com/PuerkitoBio/goquery"
-	"github.com/buger/jsonparser"
 	"github.com/go-resty/resty/v2"
-	"github.com/json-iterator/go"
 	"github.com/logrusorgru/aurora"
 	"github.com/remeh/sizedwaitgroup"
 	"github.com/rs/zerolog"
-	zlog "github.com/rs/zerolog/log"
 	"gopkg.in/yaml.v3"
 )
+
+
+// ProgressSpinner displays an animated spinner
+type ProgressSpinner struct {
+	chars    []string
+	index    int
+	message  string
+	stopChan chan bool
+	doneChan chan bool
+	mu       sync.Mutex
+}
+
+// NewProgressSpinner creates a new spinner
+func NewProgressSpinner(message string) *ProgressSpinner {
+	return &ProgressSpinner{
+		chars:    []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
+		message:  message,
+		stopChan: make(chan bool),
+		doneChan: make(chan bool),
+	}
+}
+
+// Start begins the spinner animation
+func (s *ProgressSpinner) Start() {
+	go func() {
+		for {
+			select {
+			case <-s.stopChan:
+				s.doneChan <- true
+				return
+			default:
+				s.mu.Lock()
+				fmt.Printf("\r%s %s", s.chars[s.index], s.message)
+				s.index = (s.index + 1) % len(s.chars)
+				s.mu.Unlock()
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+}
+
+// Stop stops the spinner with a completion message
+func (s *ProgressSpinner) Stop(message string) {
+	s.stopChan <- true
+	<-s.doneChan
+	fmt.Printf("\r✓ %s\n", message)
+}
+
+// UpdateMessage updates the spinner message
+func (s *ProgressSpinner) UpdateMessage(message string) {
+	s.mu.Lock()
+	s.message = message
+	s.mu.Unlock()
+}
 
 // Constants
 const (
@@ -85,10 +132,10 @@ type Config struct {
 	} `yaml:"swagger"`
 	
 	Output struct {
-		Directory string `yaml:"directory"`
+		Directory string   `yaml:"directory"`
 		Formats   []string `yaml:"formats"`
-		Verbose   bool   `yaml:"verbose"`
-		SaveRaw   bool   `yaml:"save_raw"`
+		Verbose   bool     `yaml:"verbose"`
+		SaveRaw   bool     `yaml:"save_raw"`
 	} `yaml:"output"`
 	
 	API struct {
@@ -171,15 +218,15 @@ type ScanResult struct {
 
 // Statistics
 type Statistics struct {
-	TotalSubdomains   int `json:"total_subdomains"`
-	ActiveSubdomains  int `json:"active_subdomains"`
-	SwaggerFound      int `json:"swagger_found"`
-	Vulnerabilities   int `json:"vulnerabilities"`
-	Critical          int `json:"critical"`
-	High              int `json:"high"`
-	Medium            int `json:"medium"`
-	Low               int `json:"low"`
-	Info              int `json:"info"`
+	TotalSubdomains   int   `json:"total_subdomains"`
+	ActiveSubdomains  int   `json:"active_subdomains"`
+	SwaggerFound      int   `json:"swagger_found"`
+	Vulnerabilities   int   `json:"vulnerabilities"`
+	Critical          int   `json:"critical"`
+	High              int   `json:"high"`
+	Medium            int   `json:"medium"`
+	Low               int   `json:"low"`
+	Info              int   `json:"info"`
 	RequestsSent      int64 `json:"requests_sent"`
 	ResponsesReceived int64 `json:"responses_received"`
 	Errors            int64 `json:"errors"`
@@ -201,20 +248,117 @@ type SwaggerScanner struct {
 	cancel        context.CancelFunc
 }
 
+// displayStageBanner displays a stage banner
+func displayStageBanner(stage, description string) {
+	au := aurora.NewAurora(true)
+	
+	stages := map[string]func(interface{}) aurora.Value{
+		"subdomain":   au.Blue,
+		"swagger":     au.Magenta,
+		"analysis":    au.Yellow,
+		"testing":     au.Cyan,
+		"reporting":   au.Green,
+		"complete":    au.BrightGreen,
+	}
+	
+	colorFunc := stages[stage]
+	if colorFunc == nil {
+		colorFunc = au.White
+	}
+	
+	banner := fmt.Sprintf(`
+┌────────────────────────────────────────────────────────────┐
+│  STAGE: %-46s │
+│  %-52s │
+└────────────────────────────────────────────────────────────┘`,
+		strings.ToUpper(stage),
+		description)
+	
+	fmt.Println(colorFunc(banner))
+	fmt.Println()
+}
+
+// displayVulnBanner displays vulnerability findings
+func displayVulnBanner(count int, critical, high int) {
+	au := aurora.NewAurora(true)
+	
+	var severity string
+	var colorFunc func(interface{}) aurora.Value
+	
+	switch {
+	case critical > 0:
+		severity = "CRITICAL"
+		colorFunc = au.Red
+	case high > 0:
+		severity = "HIGH"
+		colorFunc = au.Magenta
+	case count > 0:
+		severity = "MEDIUM/LOW"
+		colorFunc = au.Yellow
+	default:
+		severity = "NONE FOUND"
+		colorFunc = au.Green
+	}
+	
+	banner := fmt.Sprintf(`
+╔════════════════════════════════════════════════════════════╗
+║                    VULNERABILITY REPORT                    ║
+╠════════════════════════════════════════════════════════════╣
+║  Total Findings: %-43d ║
+║  Severity Level: %-43s ║
+║  Critical: %-47d ║
+║  High: %-51d ║
+╚════════════════════════════════════════════════════════════╝`,
+		count, severity, critical, high)
+	
+	fmt.Println(colorFunc(banner))
+	fmt.Println()
+}
+
 // NewSwaggerScanner creates a new scanner instance
 func NewSwaggerScanner(configPath string) (*SwaggerScanner, error) {
 	// Load configuration
+
+	au := aurora.NewAurora(true)
+		
 	config, err := loadConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
+		// Setup logger with custom format
+	output := zerolog.ConsoleWriter{Out: os.Stderr}
+	output.TimeFormat = "15:04:05"
+	output.FormatLevel = func(i interface{}) string {
+		var l string
+		if ll, ok := i.(string); ok {
+			switch ll {
+			case "debug":
+				l = au.Cyan("•").String()
+			case "info":
+				l = au.Green("✓").String()
+			case "warn":
+				l = au.Yellow("⚠").String()
+			case "error":
+				l = au.Red("✗").String()
+			default:
+				l = "•"
+			}
+		}
+		return l
+	}
+	output.FormatMessage = func(i interface{}) string {
+		return fmt.Sprintf("%s", i)
+	}
+	
+	logger := zerolog.New(output).With().Timestamp().Logger()
+
 	// Setup logger
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	logger := zerolog.New(zerolog.ConsoleWriter{
-		Out:        os.Stderr,
-		TimeFormat: "2006-01-02 15:04:05",
-	}).With().Timestamp().Logger()
+	// zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	// logger := zerolog.New(zerolog.ConsoleWriter{
+	//	Out:        os.Stderr,
+	//	TimeFormat: "2006-01-02 15:04:05",
+	// }).With().Timestamp().Logger()
 
 	// Create HTTP client
 	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
@@ -236,18 +380,15 @@ func NewSwaggerScanner(configPath string) (*SwaggerScanner, error) {
 		httpClient.SetProxy(config.Scanner.Proxy)
 	}
 
-	// Create subfinder runner
-	subfinderConfig := &runner.Config{
-		Threads:            config.Subfinder.Threads,
-		Timeout:            config.Subfinder.Timeout,
-		MaxEnumerationTime: config.Subfinder.MaxEnumeration,
-		Resolvers:          resolve.DefaultResolvers,
-		Sources:            passive.DefaultSources,
-		AllSources:         config.Subfinder.All,
-		Recursive:          config.Subfinder.Recursive,
-	}
-
-	subfinderRunner, err := runner.NewRunner(subfinderConfig)
+	// Create subfinder runner with minimal configuration
+	// Create subfinder runner with minimal configuration
+opts := &runner.Options{
+	Threads:            config.Subfinder.Threads,
+	Timeout:            config.Subfinder.Timeout,
+	MaxEnumerationTime: config.Subfinder.MaxEnumeration,
+}
+	
+	subfinderRunner, err := runner.NewRunner(opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create subfinder runner: %w", err)
 	}
@@ -423,8 +564,12 @@ func getDefaultConfig() *Config {
 }
 
 // Run starts the scanning process
+// Run starts the scanning process
 func (s *SwaggerScanner) Run(domain string) error {
 	s.logger.Info().Str("domain", domain).Msg("Starting Swagger vulnerability scanner")
+	
+	// Display initial banner
+	displayStageBanner("subdomain", "Enumerating subdomains using multiple techniques")
 	
 	s.results.Target = domain
 	startTime := time.Now()
@@ -436,6 +581,7 @@ func (s *SwaggerScanner) Run(domain string) error {
 	}()
 	
 	// Step 1: Enumerate subdomains
+	displayStageBanner("subdomain", fmt.Sprintf("Scanning %s for subdomains", domain))
 	subdomains, err := s.enumerateSubdomains(domain)
 	if err != nil {
 		return fmt.Errorf("subdomain enumeration failed: %w", err)
@@ -445,16 +591,22 @@ func (s *SwaggerScanner) Run(domain string) error {
 	s.stats.TotalSubdomains = len(subdomains)
 	
 	// Step 2: Find Swagger/OpenAPI endpoints
+	displayStageBanner("swagger", "Searching for Swagger/OpenAPI documentation")
 	swaggerEndpoints := s.findSwaggerEndpoints(subdomains)
 	s.stats.SwaggerFound = len(swaggerEndpoints)
 	
 	// Step 3: Analyze Swagger specifications for vulnerabilities
+	displayStageBanner("analysis", "Analyzing API specifications for security issues")
 	s.analyzeSwaggerSpecs(swaggerEndpoints)
 	
 	// Step 4: Test endpoints for vulnerabilities
 	if s.config.Swagger.TestEndpoints {
+		displayStageBanner("testing", "Testing API endpoints with security payloads")
 		s.testEndpoints(swaggerEndpoints)
 	}
+	
+	// Step 5: Generate reports
+	displayStageBanner("reporting", "Generating comprehensive security reports")
 	
 	return nil
 }
@@ -513,7 +665,8 @@ func (s *SwaggerScanner) runSubfinder(domain string) ([]*SubdomainResult, error)
 	
 	buffer := &bytes.Buffer{}
 	
-	err := s.subfinder.EnumerateSingleDomain(domain, []io.Writer{buffer})
+	// Use the runner properly - simplified for current Subfinder API
+	_, err := s.subfinder.EnumerateSingleDomainWithCtx(s.ctx, domain, []io.Writer{buffer})
 	if err != nil {
 		return nil, err
 	}
@@ -927,7 +1080,7 @@ func (s *SwaggerScanner) analyzeSingleSpec(spec SwaggerSpec) []Vulnerability {
 								CWE:         []string{"CWE-306"},
 								CVSS:        7.5,
 								Timestamp:   time.Now(),
-									Tags: []string{"authentication", "endpoint"},
+								Tags:        []string{"authentication", "endpoint"},
 							}
 							vulnerabilities = append(vulnerabilities, vuln)
 						}
@@ -1875,6 +2028,27 @@ func (s *SwaggerScanner) printSummary() {
 	fmt.Println(strings.Repeat("=", 80))
 	fmt.Println(au.Cyan("📁 Reports saved to: " + s.config.Output.Directory))
 	fmt.Println(strings.Repeat("=", 80))
+
+		// Add completion banner
+	fmt.Println()
+	fmt.Println(strings.Repeat("▁", 80))
+	fmt.Println(au.Bold(au.Green(" SCAN COMPLETED SUCCESSFULLY ")).String())
+	fmt.Println(strings.Repeat("▔", 80))
+	fmt.Println()
+	fmt.Println(au.Cyan("📁 Reports saved to: " + s.config.Output.Directory))
+	
+	// Show quick actions
+	if s.stats.Vulnerabilities > 0 {
+		fmt.Println()
+		fmt.Println(au.Bold("🚨 RECOMMENDED ACTIONS:"))
+		fmt.Println(strings.Repeat("-", 40))
+		fmt.Println("1. Review all critical and high severity vulnerabilities")
+		fmt.Println("2. Check the HTML report for detailed analysis")
+		fmt.Println("3. Prioritize fixing based on CVSS scores")
+		fmt.Println("4. Re-scan after implementing fixes")
+	}
+	fmt.Println(strings.Repeat("=", 80))
+
 }
 
 // Helper functions
@@ -1928,6 +2102,71 @@ func min(a, b int) int {
 	return b
 }
 
+// displayBanner displays the ASCII art banner
+func displayBanner() {
+	au := aurora.NewAurora(true)
+	
+	banner := `
+███████╗██╗    ██╗ █████╗  ██████╗  ██████╗ ███████╗██████╗ 
+██╔════╝██║    ██║██╔══██╗██╔════╝ ██╔════╝ ██╔════╝██╔══██╗
+███████╗██║ █╗ ██║███████║██║  ███╗██║  ███╗█████╗  ██████╔╝
+╚════██║██║███╗██║██╔══██║██║   ██║██║   ██║██╔══╝  ██╔══██╗
+███████║╚███╔███╔╝██║  ██║╚██████╔╝╚██████╔╝███████╗██║  ██║
+╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝
+███████╗ ██████╗ ██████╗ ███╗   ██╗███╗   ██╗███████╗██████╗ 
+██╔════╝██╔════╝██╔═══██╗████╗  ██║████╗  ██║██╔════╝██╔══██╗
+███████╗██║     ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██████╔╝
+╚════██║██║     ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██╔══██╗
+███████║╚██████╗╚██████╔╝██║ ╚████║██║ ╚████║███████╗██║  ██║
+╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝
+=============================================================
+                 Swagger Vulnerability Scanner
+                     Version: %s
+             Discover • Analyze • Secure • Report
+=============================================================`
+
+	// Create color gradient effect
+	colors := []func(interface{}) aurora.Value{
+		au.Cyan,
+		au.BrightCyan,
+		au.Blue,
+		au.BrightBlue,
+		au.Magenta,
+		au.BrightMagenta,
+	}
+	
+	lines := strings.Split(banner, "\n")
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		colorIndex := i % len(colors)
+		if i == len(lines)-3 { // Version line
+			fmt.Println(colors[colorIndex](fmt.Sprintf(line, Version)))
+		} else {
+			fmt.Println(colors[colorIndex](line))
+		}
+	}
+	fmt.Println()
+}
+
+// displayMiniBanner displays a smaller banner for scan start
+func displayMiniBanner(domain string) {
+	au := aurora.NewAurora(true)
+	
+	miniBanner := `
+┌────────────────────────────────────────────────────────────┐
+│                    SWAGGER SCANNER v%s                    │
+├────────────────────────────────────────────────────────────┤
+│  Target: %-50s │
+│  Started: %-48s │
+└────────────────────────────────────────────────────────────┘`
+	
+	currentTime := time.Now().Format("2006-01-02 15:04:05")
+	fmt.Println(au.Cyan(fmt.Sprintf(miniBanner, Version, domain, currentTime)))
+	fmt.Println()
+}
+
 // Main function
 func main() {
 	var (
@@ -1937,7 +2176,6 @@ func main() {
 		outputDir   = flag.String("o", "results", "Output directory")
 		verbose     = flag.Bool("v", false, "Verbose output")
 		rateLimit   = flag.Int("r", RateLimit, "Rate limit (requests per second)")
-		noSwagger   = flag.Bool("no-swagger", false, "Skip Swagger scanning")
 		noTest      = flag.Bool("no-test", false, "Skip endpoint testing")
 		timeout     = flag.Int("timeout", 30, "Timeout in seconds")
 		proxy       = flag.String("proxy", "", "HTTP proxy to use")
@@ -1957,6 +2195,9 @@ func main() {
 	}
 	
 	flag.Parse()
+
+	
+	
 	
 	if *version {
 		fmt.Printf("Swagger Vulnerability Scanner v%s\n", Version)
@@ -1964,10 +2205,15 @@ func main() {
 	}
 	
 	if *domain == "" {
+		displayBanner()
 		flag.Usage()
 		os.Exit(1)
 	}
 	
+	// Display banner
+	displayBanner()
+	displayMiniBanner(*domain)
+
 	// Create scanner
 	scanner, err := NewSwaggerScanner(*configPath)
 	if err != nil {
