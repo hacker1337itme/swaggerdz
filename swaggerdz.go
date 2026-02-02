@@ -381,12 +381,11 @@ func NewSwaggerScanner(configPath string) (*SwaggerScanner, error) {
 	}
 
 	// Create subfinder runner with minimal configuration
-	// Create subfinder runner with minimal configuration
-opts := &runner.Options{
-	Threads:            config.Subfinder.Threads,
-	Timeout:            config.Subfinder.Timeout,
-	MaxEnumerationTime: config.Subfinder.MaxEnumeration,
-}
+	opts := &runner.Options{
+		Threads:            config.Subfinder.Threads,
+		Timeout:            config.Subfinder.Timeout,
+		MaxEnumerationTime: config.Subfinder.MaxEnumeration,
+	}
 	
 	subfinderRunner, err := runner.NewRunner(opts)
 	if err != nil {
@@ -701,147 +700,144 @@ func (s *SwaggerScanner) runSubfinder(domain string) ([]*SubdomainResult, error)
 
 // bruteForceSubdomains performs brute force subdomain enumeration
 func (s *SwaggerScanner) bruteForceSubdomains(domain string) []*SubdomainResult {
-	// Validate domain input
-	if domain == "" {
-		s.logger.Warn("Empty domain provided for subdomain brute forcing")
-		return nil
-	}
-
-	// Get wordlist
-	wordlist := s.loadWordlist()
-	if len(wordlist) == 0 {
-		s.logger.Warn("Empty wordlist for subdomain brute forcing")
-		return nil
-	}
-
-	// Prepare concurrency controls
-	var (
-		wg         sync.WaitGroup
-		results    []*SubdomainResult
-		resultChan = make(chan *SubdomainResult, len(wordlist))
-		semaphore  = make(chan struct{}, s.config.Scanner.Threads)
-		mu         sync.Mutex
-	)
-
-	// Process results in background
-	go func() {
-		for result := range resultChan {
-			mu.Lock()
-			results = append(results, result)
-			mu.Unlock()
-		}
-	}()
-
-	// Worker function for DNS resolution
-	resolveSubdomain := func(sub string) {
-		defer wg.Done()
-
-		// Acquire semaphore
-		semaphore <- struct{}{}
-		defer func() { <-semaphore }()
-
-		// Skip empty subdomains
-		sub = strings.TrimSpace(sub)
-		if sub == "" {
-			return
-		}
-
-		fullDomain := sub + "." + domain
-
-		// Try to resolve with timeout context
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		var resolver net.Resolver
-		ips, err := resolver.LookupIPAddr(ctx, fullDomain)
-		if err != nil || len(ips) == 0 {
-			return
-		}
-
-		// Convert IPs to strings
-		ipStrings := make([]string, len(ips))
-		for i, ip := range ips {
-			ipStrings[i] = ip.String()
-		}
-
-		// Send result
-		resultChan <- &SubdomainResult{
-			Domain:      domain,
-			Subdomain:   fullDomain,
-			IPAddresses: ipStrings,
-			Sources:     []string{"bruteforce"},
-			Status:      "active",
-			Timestamp:   time.Now(),
-		}
-
-		s.logger.Debug("Found subdomain via brute force", "subdomain", fullDomain, "ips", ipStrings)
-	}
-
-	// Launch goroutines for each subdomain
-	for _, sub := range wordlist {
-		wg.Add(1)
-		go resolveSubdomain(sub)
-	}
-
-	// Wait for all workers and close channel
-	wg.Wait()
-	close(resultChan)
-
-	// Log summary
-	s.logger.Info("Subdomain brute force completed",
-		"domain", domain,
-		"wordlist_size", len(wordlist),
-		"found", len(results))
-
-	return results
-}
-
-// loadWordlist loads wordlist from file or returns default
-func (s *SwaggerScanner) loadWordlist() []string {
+	var results []*SubdomainResult
+	
 	wordlistPath := s.config.Wordlists.Subdomains
 	if wordlistPath == "" {
 		wordlistPath = "wordlists/subdomains.txt"
 	}
-
-	// Try to read from file first
-	if data, err := os.ReadFile(wordlistPath); err == nil {
-		lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
-		// Filter out empty lines and comments
-		var filtered []string
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "//") {
-				filtered = append(filtered, line)
-			}
-		}
-		if len(filtered) > 0 {
-			s.logger.Debug("Loaded wordlist from file", "path", wordlistPath, "size", len(filtered))
-			return filtered
-		}
-	} else if !os.IsNotExist(err) {
-		s.logger.Warn("Error reading wordlist file", "path", wordlistPath, "error", err)
-	}
-
-	// Return default wordlist if file doesn't exist or is empty
+	
+	// Default wordlist if file doesn't exist
 	defaultWordlist := []string{
-		"api", "dev", "staging", "test", "uat", "prod", "mobile", "m",
-		"admin", "dashboard", "console", "control", "manage",
-		"app", "apps", "application", "web", "www", "mail",
-		"secure", "auth", "login", "signin", "account",
-		"api-gateway", "gateway", "microservice", "service",
-		"v1", "v2", "v3", "beta", "alpha", "internal",
-		"docs", "documentation", "help", "support",
-		"swagger", "openapi", "redoc", "rapidoc",
-		"rest", "soap", "graphql", "rpc",
-		"backup", "backups", "archive", "archives",
-		"db", "database", "sql", "nosql", "redis", "cache",
-		"ftp", "sftp", "ssh", "vpn", "proxy",
-		"monitor", "monitoring", "metrics", "logs", "logging",
+		// Common prefixes
+		"api", "app", "apps", "application", "web", "www", "mail", "m",
+		"dev", "development", "staging", "test", "testing", "qa", "uat", "prod", "production",
+		"mobile", "mob", "admin", "administrator", "dashboard", "console", "control", "manage", "manager",
+		
+		// Environments and versions
+		"alpha", "beta", "gamma", "canary", "nightly", "experimental",
+		"v1", "v2", "v3", "v4", "v5", "v10", "v01", "v02",
+		"version1", "version2", "version3",
+		"internal", "external", "private", "public", "secure", "auth", "authentication",
+		"login", "signin", "signup", "register", "account", "accounts",
+		
+		// Infrastructure and services
+		"api-gateway", "gateway", "microservice", "service", "services",
+		"backend", "frontend", "backend-api", "frontend-api",
+		"server", "servers", "cluster", "clusters", "node", "nodes",
+		"loadbalancer", "lb", "load-balancer", "proxy", "proxies",
+		"cdn", "cache", "caching", "redis", "database", "db", "mysql", "postgres", "mongodb",
+		
+		// Documentation and developer tools
+		"docs", "documentation", "doc", "help", "support", "wiki", "knowledgebase",
+		"swagger", "openapi", "redoc", "rapidoc", "swagger-ui", "openapi-docs",
+		"graphql", "graphiql", "playground", "sandbox", "explorer",
+		"status", "health", "healthcheck", "monitoring", "metrics", "prometheus", "grafana",
+		
+		// Platform and integration
+		"platform", "portal", "hub", "center", "central",
+		"integration", "integrations", "connect", "connector",
+		"apiary", "postman", "insomnia", "apigee", "kong",
+		
+		// API specific
+		"rest", "restapi", "soap", "json", "xml", "rpc", "grpc",
+		"endpoint", "endpoints", "resource", "resources",
+		"client", "clients", "sdk", "library", "libraries",
+		
+		// Security and compliance
+		"secure", "security", "auth", "authentication", "oauth", "oauth2", "sso",
+		"token", "tokens", "jwt", "key", "keys", "cert", "certificate",
+		"audit", "auditing", "compliance", "pci", "hipaa", "gdpr",
+		
+		// Geographic and data centers
+		"us", "usa", "uk", "eu", "europe", "asia", "apac", "emea",
+		"east", "west", "north", "south", "central",
+		"aws", "azure", "gcp", "google", "cloud", "cloudfront",
+		
+		// Development and CI/CD
+		"ci", "cd", "cicd", "jenkins", "gitlab", "github", "bitbucket",
+		"build", "builder", "deploy", "deployment", "release",
+		"staging1", "staging2", "test1", "test2", "qa1", "qa2",
+		
+		// Customer/tenant specific
+		"customer", "customers", "tenant", "tenants", "client", "clients",
+		"partner", "partners", "vendor", "vendors", "supplier", "suppliers",
+		
+		// Legacy and deprecated
+		"legacy", "old", "deprecated", "archive", "archived",
+		"temp", "temporary", "backup", "backups",
+		
+		// Short forms and common variations
+		"svc", "srv", "api1", "api2", "api3", "api-test", "api-prod",
+		"dev1", "dev2", "stage", "preprod", "pre-prod",
+		"adm", "sysadmin", "root", "superuser",
+		
+		// Discovery and monitoring
+		"discover", "discovery", "registry", "config", "configuration",
+		"log", "logs", "logger", "logging", "analytics", "stats", "statistics",
+		
+		// File and storage
+		"file", "files", "storage", "store", "asset", "assets", "cdn1", "cdn2",
+		"upload", "uploads", "download", "downloads", "media", "images",
 	}
-
-	s.logger.Debug("Using default wordlist", "size", len(defaultWordlist))
-	return defaultWordlist
+	
+	var wordlist []string
+	if data, err := os.ReadFile(wordlistPath); err == nil {
+		wordlist = strings.Split(string(data), "\n")
+	} else {
+		wordlist = defaultWordlist
+	}
+	
+	// Use waitgroup for concurrent brute forcing
+	var wg sync.WaitGroup
+	resultChan := make(chan *SubdomainResult, len(wordlist))
+	semaphore := make(chan struct{}, s.config.Scanner.Threads)
+	
+	for _, sub := range wordlist {
+		if sub == "" {
+			continue
+		}
+		
+		wg.Add(1)
+		go func(sub string) {
+			defer wg.Done()
+			
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			
+			fullDomain := sub + "." + domain
+			
+			// Try to resolve
+			ips, err := net.LookupIP(fullDomain)
+			if err == nil && len(ips) > 0 {
+				ipStrings := make([]string, len(ips))
+				for i, ip := range ips {
+					ipStrings[i] = ip.String()
+				}
+				
+				resultChan <- &SubdomainResult{
+					Domain:      domain,
+					Subdomain:   fullDomain,
+					IPAddresses: ipStrings,
+					Sources:     []string{"bruteforce"},
+					Status:      "unknown",
+				}
+			}
+		}(sub)
+	}
+	
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	for result := range resultChan {
+		results = append(results, result)
+	}
+	
+	return results
 }
+
 // checkSubdomainActive checks if a subdomain is active
 func (s *SwaggerScanner) checkSubdomainActive(subdomain string) bool {
 	// Try HTTP and HTTPS
@@ -2290,6 +2286,12 @@ func main() {
 
 	// Create scanner
 	scanner, err := NewSwaggerScanner(*configPath)
+	// Run scan
+        if err := scanner.Run(*domain); err != nil {
+                        fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+                        os.Exit(1)
+        }
+		
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -2322,9 +2324,5 @@ func main() {
 		scanner.config.Swagger.TestEndpoints = false
 	}
 	
-	// Run scan
-	if err := scanner.Run(*domain); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
+	
 }
