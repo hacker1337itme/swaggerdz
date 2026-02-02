@@ -28,7 +28,6 @@ import (
 	"github.com/projectdiscovery/subfinder/v2/pkg/passive"
 	"github.com/projectdiscovery/subfinder/v2/pkg/resolve"
 	"github.com/projectdiscovery/subfinder/v2/pkg/runner"
-	"github.com/tomnomnom/waybackurls"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/time/rate"
 
