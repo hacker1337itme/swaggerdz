@@ -701,14 +701,128 @@ func (s *SwaggerScanner) runSubfinder(domain string) ([]*SubdomainResult, error)
 
 // bruteForceSubdomains performs brute force subdomain enumeration
 func (s *SwaggerScanner) bruteForceSubdomains(domain string) []*SubdomainResult {
-	var results []*SubdomainResult
-	
+	// Validate domain input
+	if domain == "" {
+		s.logger.Warn("Empty domain provided for subdomain brute forcing")
+		return nil
+	}
+
+	// Get wordlist
+	wordlist := s.loadWordlist()
+	if len(wordlist) == 0 {
+		s.logger.Warn("Empty wordlist for subdomain brute forcing")
+		return nil
+	}
+
+	// Prepare concurrency controls
+	var (
+		wg         sync.WaitGroup
+		results    []*SubdomainResult
+		resultChan = make(chan *SubdomainResult, len(wordlist))
+		semaphore  = make(chan struct{}, s.config.Scanner.Threads)
+		mu         sync.Mutex
+	)
+
+	// Process results in background
+	go func() {
+		for result := range resultChan {
+			mu.Lock()
+			results = append(results, result)
+			mu.Unlock()
+		}
+	}()
+
+	// Worker function for DNS resolution
+	resolveSubdomain := func(sub string) {
+		defer wg.Done()
+
+		// Acquire semaphore
+		semaphore <- struct{}{}
+		defer func() { <-semaphore }()
+
+		// Skip empty subdomains
+		sub = strings.TrimSpace(sub)
+		if sub == "" {
+			return
+		}
+
+		fullDomain := sub + "." + domain
+
+		// Try to resolve with timeout context
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		var resolver net.Resolver
+		ips, err := resolver.LookupIPAddr(ctx, fullDomain)
+		if err != nil || len(ips) == 0 {
+			return
+		}
+
+		// Convert IPs to strings
+		ipStrings := make([]string, len(ips))
+		for i, ip := range ips {
+			ipStrings[i] = ip.String()
+		}
+
+		// Send result
+		resultChan <- &SubdomainResult{
+			Domain:      domain,
+			Subdomain:   fullDomain,
+			IPAddresses: ipStrings,
+			Sources:     []string{"bruteforce"},
+			Status:      "active",
+			Timestamp:   time.Now(),
+		}
+
+		s.logger.Debug("Found subdomain via brute force", "subdomain", fullDomain, "ips", ipStrings)
+	}
+
+	// Launch goroutines for each subdomain
+	for _, sub := range wordlist {
+		wg.Add(1)
+		go resolveSubdomain(sub)
+	}
+
+	// Wait for all workers and close channel
+	wg.Wait()
+	close(resultChan)
+
+	// Log summary
+	s.logger.Info("Subdomain brute force completed",
+		"domain", domain,
+		"wordlist_size", len(wordlist),
+		"found", len(results))
+
+	return results
+}
+
+// loadWordlist loads wordlist from file or returns default
+func (s *SwaggerScanner) loadWordlist() []string {
 	wordlistPath := s.config.Wordlists.Subdomains
 	if wordlistPath == "" {
 		wordlistPath = "wordlists/subdomains.txt"
 	}
-	
-	// Default wordlist if file doesn't exist
+
+	// Try to read from file first
+	if data, err := os.ReadFile(wordlistPath); err == nil {
+		lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		// Filter out empty lines and comments
+		var filtered []string
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "//") {
+				filtered = append(filtered, line)
+			}
+		}
+		if len(filtered) > 0 {
+			s.logger.Debug("Loaded wordlist from file", "path", wordlistPath, "size", len(filtered))
+			return filtered
+		}
+	} else if !os.IsNotExist(err) {
+		s.logger.Warn("Error reading wordlist file", "path", wordlistPath, "error", err)
+	}
+
+	// Return default wordlist if file doesn't exist or is empty
 	defaultWordlist := []string{
 		"api", "dev", "staging", "test", "uat", "prod", "mobile", "m",
 		"admin", "dashboard", "console", "control", "manage",
@@ -718,65 +832,16 @@ func (s *SwaggerScanner) bruteForceSubdomains(domain string) []*SubdomainResult 
 		"v1", "v2", "v3", "beta", "alpha", "internal",
 		"docs", "documentation", "help", "support",
 		"swagger", "openapi", "redoc", "rapidoc",
+		"rest", "soap", "graphql", "rpc",
+		"backup", "backups", "archive", "archives",
+		"db", "database", "sql", "nosql", "redis", "cache",
+		"ftp", "sftp", "ssh", "vpn", "proxy",
+		"monitor", "monitoring", "metrics", "logs", "logging",
 	}
-	
-	var wordlist []string
-	if data, err := os.ReadFile(wordlistPath); err == nil {
-		wordlist = strings.Split(string(data), "\n")
-	} else {
-		wordlist = defaultWordlist
-	}
-	
-	// Use waitgroup for concurrent brute forcing
-	var wg sync.WaitGroup
-	resultChan := make(chan *SubdomainResult, len(wordlist))
-	semaphore := make(chan struct{}, s.config.Scanner.Threads)
-	
-	for _, sub := range wordlist {
-		if sub == "" {
-			continue
-		}
-		
-		wg.Add(1)
-		go func(sub string) {
-			defer wg.Done()
-			
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-			
-			fullDomain := sub + "." + domain
-			
-			// Try to resolve
-			ips, err := net.LookupIP(fullDomain)
-			if err == nil && len(ips) > 0 {
-				ipStrings := make([]string, len(ips))
-				for i, ip := range ips {
-					ipStrings[i] = ip.String()
-				}
-				
-				resultChan <- &SubdomainResult{
-					Domain:      domain,
-					Subdomain:   fullDomain,
-					IPAddresses: ipStrings,
-					Sources:     []string{"bruteforce"},
-					Status:      "unknown",
-				}
-			}
-		}(sub)
-	}
-	
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-	
-	for result := range resultChan {
-		results = append(results, result)
-	}
-	
-	return results
-}
 
+	s.logger.Debug("Using default wordlist", "size", len(defaultWordlist))
+	return defaultWordlist
+}
 // checkSubdomainActive checks if a subdomain is active
 func (s *SwaggerScanner) checkSubdomainActive(subdomain string) bool {
 	// Try HTTP and HTTPS
